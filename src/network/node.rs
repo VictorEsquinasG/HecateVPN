@@ -32,34 +32,19 @@ impl NetworkNode {
     }
 
     /// Receives packets indefinitely
-    pub async fn receive_loop(&self) {
+    pub async fn receive_loop(&self) -> anyhow::Result<()> {
         let mut buffer = [0u8; 1024];
 
         loop {
-            match self.socket.recv_from(&mut buffer).await {
-                Ok((len, addr)) => {
-                    if let Ok(packet) = bincode::deserialize::<Packet>(&buffer[..len]) {
-                        println!(
-                            "Received from {} | id={} | payload={}",
-                            addr,
-                            packet.id,
-                            String::from_utf8_lossy(&packet.payload)
-                        );
-                    } else {
-                        eprintln!("Failed to deserialize packet from {}", addr);
-                    }
-                }
-                Err(e) => {
-                    eprintln!("Receive error: {}", e);
-                }
+            let (len, addr) = self.socket.recv_from(&mut buffer).await?;
+            if let Ok(packet) = bincode::deserialize::<Packet>(&buffer[..len]) {
+                println!(
+                    "Received from {} | id={} | payload={}",
+                    addr,
+                    packet.id,
+                    String::from_utf8_lossy(&packet.payload)
+                );
             }
         }
     }
 }
-
-/*
-TODO:
-- Add encryption layer
-- Support multiple peers
-- Implement LAN broadcast simulation
-*/
