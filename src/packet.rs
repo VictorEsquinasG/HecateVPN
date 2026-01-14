@@ -6,18 +6,27 @@ use serde::{Serialize, Deserialize};
 /// - carry encrypted payloads
 /// - include routing information
 /// - simulate LAN broadcast packets
+
 #[derive(Serialize, Deserialize, Debug)]
 pub struct Packet {
-    /// Unique packet identifier
     pub id: u64,
-
-    /// Raw payload bytes
     pub payload: Vec<u8>,
 }
 
-/*
-TODO:
-- Add packet type (Handshake, Data, Ping)
-- Add optional encryption flag
-- Add checksum or integrity verification
-*/
+impl Packet {
+    pub fn encode(&self) -> Vec<u8> {
+        bincode::serialize(self).unwrap()
+    }
+
+    pub fn decode(data: &[u8]) -> anyhow::Result<Self> {
+        Ok(bincode::deserialize(data)?)
+    }
+
+    pub fn ping() -> Self {
+        Self {
+            id: rand::random(),
+            payload: b"ping".to_vec(),
+        }
+    }
+}
+
