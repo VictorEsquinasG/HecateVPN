@@ -1,11 +1,12 @@
-use std::net::SocketAddr;
-use std::sync::atomic::Ordering;
+use std::net::{Shutdown, SocketAddr};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UdpSocket;
 
 use crate::app::AppState;
-use crate::packet::Packet;
+use crate::packet::{Packet, PacketPayload, ControlMessage};
 
 /// NetworkNode manages the bridge between the physical network (UDP)
 /// and the virtual network (TAP interface)
@@ -24,7 +25,7 @@ impl NetworkNode {
         bind_addr: SocketAddr,
         peer: SocketAddr,
         state: Arc<AppState>,
-        virtual_ip: &str
+        virtual_ip: &str,
     ) -> anyhow::Result<Self> {
         // Bind UDP socket (Physical layer)
         let socket = UdpSocket::bind(bind_addr).await?;
@@ -34,7 +35,11 @@ impl NetworkNode {
 
         // Configure TAP device (Virtual layer)
         let mut config = tun::Configuration::default();
-        config.address(virtual_ip).netmask("255.255.255.0").destination(virtual_ip).up();
+        config
+            .address(virtual_ip)
+            .netmask("255.255.255.0")
+            .destination(virtual_ip)
+            .up();
 
         #[cfg(target_os = "linux")]
         config.platform(|config| {
@@ -51,55 +56,111 @@ impl NetworkNode {
         })
     }
 
-    pub async fn run(&self) -> anyhow::Result<()> {
+    // Accept Shutdown flag
+    pub async fn run(&self, shutdown: Arc<AtomicBool>) -> anyhow::Result<()> {
         let mut buf_tun = [0u8; 4096]; // Buffer for reading from Visual Interface
         let mut buf_udp = [0u8; 4096]; // Buffer for reading from Physical Interface
-        
-        // Use tokio select to handle whichever comes first:
-        // 1. The game sends a packet (Read from TUN)
-        // 2. The peer sends a packet (Read from UDP)
-        tokio::select! {
-        // A. - Outbound: TAP -> UDP
-        // Lock TUN device to read
-        res = async {
-            let mut locket_dev = self.tun_device.lock().await;
-            locket_dev.read(&mut buf_tun).await
-        } => {
-        match res {
-            Ok(n) => {
-                // Wrap the raw frame in our Packet structure
-                let packet = Packet::new(buf_tun[0..n].to_vec());
-                // Serialize (and encrypt in the future)
-                let encoded = bincode::serialize(&packet)?;
-                // Send over UDP
-                self.socket.send_to(&encoded, self.peer).await?;
-            },
-            Err(e) => eprint!("Error reading from TUN device: {}", e),
-        }
+
+        self.state.log("🤝 Sending HELLO".into());
+        let hello = Packet::hello();
+        self.socket.send_to(&hello.encode(), self.peer).await?;
+
+        let start = tokio::time::Instant::now();
+        let timeout = tokio::time::Duration::from_secs(5);
+
+        loop {
+            // Check for shutdown request
+            if shutdown.load(Ordering::Relaxed) {
+                self.state.log("🛑 Network loop stopped".into());
+                break;
+            }
+            // Check for timeout
+            if !self.state.connected.load(Ordering::Relaxed) && start.elapsed() > timeout {
+                self.state.log("❌ Connection failed (timeout)".into());
+                return Ok(());
+            }
+
+            // Use tokio select to handle whichever comes first:
+            // 1. The game sends a packet (Read from TUN)
+            // 2. The peer sends a packet (Read from UDP)
+            tokio::select! {
+                // A. - Outbound: TAP -> UDP
+                // Lock TUN device to read
+                res = async {
+                    let mut locket_dev = self.tun_device.lock().await;
+                    locket_dev.read(&mut buf_tun).await
+                } => {
+                match res {
+                    Ok(n) => {
+                        // Wrap the raw frame in our Packet structure
+                        let packet = Packet::data(buf_tun[..n].to_vec());
+                        // Serialize (and encrypt in the future)
+                        let encoded = bincode::serialize(&packet)?;
+                        // Send over UDP
+                        let _ = self.socket.send_to(&encoded, self.peer).await?;
+                    }
+                    Err(e) => {
+                        eprint!("Error reading from TUN device: {}", e);
+                    }
+                }
+                }
 
                 // B. - Inbound: UDP -> TAP
                 res = self.socket.recv_from(&mut buf_udp) => {
                     match res {
-                        Ok((n,src_addr)) => {
-                            // Security check: only accept packets from the known peer
-                            if src_addr == self.peer{
-                                // Deserialize (and decrypt in the future)
-                               if let Ok(packet) = bincode::deserialize::<Packet>(&buf_udp[..n]) {
-                                // Write raw frame to the Virtual Interface
-                                // The OS will now "think" this packet arrived from local network
-                                let mut locket_dev = self.tun_device.lock().await;
-                                locket_dev.write_all(&packet.payload).await?;
-                               }
+                        Ok((n, src_addr)) => {
+                            if src_addr != self.peer {
+                                return Ok(());
+                            }
+
+                            let packet = match Packet::decode(&buf_udp[..n]) {
+                                Ok(p) => p,
+                                Err(_) => return Err(anyhow::anyhow!("Packet decode failed")),
+                            };
+
+                            match packet.payload {
+                                PacketPayload::Control(msg) => {
+                                    match msg {
+                                        ControlMessage::Hello => {
+                                            self.state.log("👋 HELLO received".into());
+                                            let ack = Packet::hello_ack();
+                                            let _ = self.socket.send_to(&ack.encode(), self.peer).await;
+                                        }
+
+                                        ControlMessage::HelloAck => {
+                                            if !self.state.connected.load(Ordering::Relaxed) {
+                                                self.state.connected.store(true, Ordering::Relaxed);
+                                                self.state.log("✅ Connected!".into());
+                                            }
+                                        }
+
+                                        ControlMessage::Ping => {
+                                            let pong = Packet::pong();
+                                            let _ = self.socket.send_to(&pong.encode(), self.peer).await;
+                                        }
+
+                                        ControlMessage::Pong => {
+                                            self.state.log("🏓 Pong received".into());
+                                        }
+                                    }
+                                }
+
+                                PacketPayload::Data(frame) => {
+                                    let mut dev = self.tun_device.lock().await;
+                                    let _ = dev.write_all(&frame).await;
+                                }
                             }
                         }
-                    },
-                    Err(e) => {
-                        eprint!("Error reading from UDP socket: {}", e),
+
+                        Err(e) => {
+                            eprintln!("UDP recv error: {}", e);
+                        }
                     }
                 }
 
             }
         }
+        Ok(())
     }
 
     /// The main loop that bridges the traffic
@@ -113,31 +174,33 @@ impl NetworkNode {
         Ok(())
     }
 
-    pub async fn receive_loop(&self) -> anyhow::Result<()> {
-        let mut buf_tun = [0u8; 4096]; // Buffer for reading from Visual Interface
-        let mut buf_udp = [0u8; 4096]; // Buffer for reading from Physical Interface
+    // pub async fn receive_loop(&self) -> anyhow::Result<()> {
+    //     let mut buf = [0u8; 4096]; // Buffer for reading from Visual Interface
+    //                                // let mut buf_tun = [0u8; 4096]; // Buffer for reading from Visual Interface
+    //                                // let mut buf_udp = [0u8; 4096]; // Buffer for reading from Physical Interface
 
-        self.state.log("📡 Receive loop started".into());
+    //     self.state.log("📡 Receive loop started".into());
 
-        loop {
-            if self.state.shutdown.load(Ordering::Relaxed) {
-                self.state.log("🛑 Receive loop stopped".into());
-                break;
-            }
+    //     loop {
+    //         if self.state.shutdown.load(Ordering::Relaxed) {
+    //             self.state.log("🛑 Receive loop stopped".into());
+    //             break;
+    //         }
 
-            let len = self.socket.recv(&mut buf).await?;
+    //         let len = self.socket.recv(&mut buf).await?;
 
-            let packet = Packet::decode(&buf[..len])?;
+    //         let packet = Packet::decode(&buf[..len])?;
 
-            // Primer paquete = conexión real
-            if !self.state.connected.load(Ordering::Relaxed) {
-                self.state.connected.store(true, Ordering::Relaxed);
-                self.state.log("✅ Connected!".into());
-            }
+    //         // Primer paquete = conexión real
+    //         if !self.state.connected.load(Ordering::Relaxed) {
+    //             self.state.connected.store(true, Ordering::Relaxed);
+    //             self.state.log("✅ Connected!".into());
+    //         }
 
-            self.state.log(format!("📥 Packet id={} ({} bytes)", packet.id, len));
-        }
+    //         self.state
+    //             .log(format!("📥 Packet id={} ({} bytes)", packet.id, len));
+    //     }
 
-        Ok(())
-    }
+    //     Ok(())
+    // }
 }

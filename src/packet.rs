@@ -7,6 +7,20 @@ use serde::{Serialize, Deserialize};
 /// - include routing information
 /// - simulate LAN broadcast packets
 
+#[derive(Serialize, Deserialize, Debug)]
+pub enum ControlMessage {
+    Hello,
+    HelloAck,
+    Ping,
+    Pong,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub enum PacketPayload {
+    Control(ControlMessage),
+    Data(Vec<u8>),
+}
+
 /// Packet structure to encapsulate network frames.
 /// We use bincode for serialize this structure before sending it over UDP.
 #[derive(Serialize, Deserialize, Debug)]
@@ -15,12 +29,12 @@ pub struct Packet {
     /// Use protocol ID or magic bytes to filter out garbage traffic from internet
     pub protocol_id: u32,
     /// The raw ethernet frame captured from TAP interface
-    pub payload: Vec<u8>,
+    pub payload: PacketPayload,
 }
 
 impl Packet {
 
-    pub fn new(payload: Vec<u8>) -> Self {
+    pub fn new(payload: PacketPayload) -> Self {
          Self {
             id: rand::random(),
             protocol_id: 0xDEADBEEF,
@@ -40,8 +54,41 @@ impl Packet {
         Self {
             id: rand::random(),
             protocol_id: 0xDEADBEEF,
-            payload: b"ping".to_vec(),
+            payload: PacketPayload::Control(ControlMessage::Ping),
         }
     }
+
+     pub fn pong() -> Self {
+        Self {
+            id: rand::random(),
+            protocol_id: 0xDEADBEEF,
+            payload: PacketPayload::Control(ControlMessage::Pong),
+        }
+    }
+
+     pub fn data(bytes: Vec<u8>) -> Self {
+        Self {
+            id: rand::random(),
+            protocol_id: 0xDEADBEEF,
+            payload: PacketPayload::Data(bytes),
+        }
+    }
+
+    pub fn hello() -> Self {
+        Self {
+            id: rand::random(),
+            protocol_id: 0xDEADBEEF,
+            payload: PacketPayload::Control(ControlMessage::Hello),
+        }
+    }
+
+    pub fn hello_ack() -> Self {
+        Self {
+            id: rand::random(),
+            protocol_id: 0xDEADBEEF,
+            payload: PacketPayload::Control(ControlMessage::HelloAck),
+        }
+    }
+
 }
 
